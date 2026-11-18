@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Slash</title>
+<style>
+  :root { --bg:#10151c; --ink:#f3efe6; --hot:#ff4d6d; --cool:#4dd6ff; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family: "Trebuchet MS", "Segoe UI", sans-serif; overflow:hidden; }
+  canvas { display:block; width:100%; height:100%; touch-action:none; }
+  #start2 { background:transparent; border:2px solid var(--cool); color:var(--cool); }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; background:rgba(16,21,28,.82); text-align:center; padding:24px; }
+  #overlay h1 { font-size:clamp(2.4rem,8vw,5rem); margin:0; letter-spacing:.02em; }
+  #overlay p { max-width:34ch; margin:0; line-height:1.5; opacity:.85; }
+  button { font:inherit; font-size:1.1rem; padding:.7em 1.6em; border:0; border-radius:999px;
+    background:var(--hot); color:#fff; cursor:pointer; }
+  button:focus-visible { outline:3px solid var(--cool); outline-offset:3px; }
+  #status { font-size:.9rem; opacity:.7; min-height:1.2em; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">
+  <h1 id="title">Air Slash</h1>
+  <p id="msg">Slice fruit with your index finger. Skip the bombs. Three misses and it is over.</p>
+  <button id="start">Start with camera</button>
+  <button id="start2">Play without camera (mouse or touch)</button>
+  <div id="status"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/';
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay'), statusEl = document.getElementById('status');
+const video = document.createElement('video'); video.playsInline = true; video.muted = true;
+let W = 0, H = 0;
+function resize(){ W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+// ---------- game state ----------
+const FRUITS = ['🍉','🍊','🍎','🍋','🍇','🥝'];
+let running = false, score = 0, lives = 3, spawnT = 0, flash = 0, last = 0;
+let fruits = [], bits = [], tips = [], trails = [], usingCamera = false;
+
+function reset(){ score = 0; lives = 3; fruits = []; bits = []; spawnT = 0; flash = 0; }
+
+function spawn(){
+  const r = Math.max(28, Math.min(W, H) * 0.06);
+  const g = H * 1.1, apex = H * (0.55 + Math.random() * 0.25);
+  const x = W * (0.15 + Math.random() * 0.7);
+  fruits.push({
+    x, y: H + r, r, g,
+    vy: -Math.sqrt(2 * g * apex),
+    vx: (W / 2 - x) * 0.35 + (Math.random() - .5) * W * 0.15,
+    bomb: Math.random() < 0.13,
+    emoji: FRUITS[Math.floor(Math.random() * FRUITS.length)],
+    rot: 0, spin: (Math.random() - .5) * 6, alive: true
+  });
+}
+
+function segDist(px, py, ax, ay, bx, by){
+  const dx = bx - ax, dy = by - ay, l2 = dx*dx + dy*dy;
+  let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+}
+
+function burst(f, color){
+  for (let i = 0; i < 14; i++){
+    const a = Math.random() * 6.283, s = 100 + Math.random() * 360;
+    bits.push({ x:f.x, y:f.y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:.6, color });
+  }
+}
+
+function checkSlices(){
+  const minSpeed = W * 0.012; // px per camera frame
+  for (const t of tips){
+    if (t.speed < minSpeed) continue;
+    for (const f of fruits){
+      if (!f.alive) continue;
+      if (segDist(f.x, f.y, t.px, t.py, t.x, t.y) < f.r){
+        f.alive = false;
+        if (f.bomb){ lives--; flash = 1; burst(f, '#ffb347'); }
+        else { score++; burst(f, '#ff4d6d'); }
+      }
+    }
+  }
+}
+
+function update(dt){
+  spawnT -= dt;
+  if (spawnT <= 0){ spawn(); if (Math.random() < .3) spawn(); spawnT = Math.max(.45, 1.1 - score * 0.012); }
+  for (const f of fruits){
+    f.vy += f.g * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.spin * dt;
+    if (f.alive && f.y - f.r > H && f.vy > 0){
+      f.alive = false;
+      if (!f.bomb){ lives--; flash = .6; }
+    }
+  }
+  fruits = fruits.filter(f => f.alive || (f.y - f.r <= H && false));
+  for (const b of bits){ b.x += b.vx * dt; b.y += b.vy * dt; b.vy += 900 * dt; b.life -= dt; }
+  bits = bits.filter(b => b.life > 0);
+  flash = Math.max(0, flash - dt * 2);
+  checkSlices();
+  if (mouseMode) tips.forEach(t => { t.px = t.x; t.py = t.y; t.speed = 0; });
+  if (lives <= 0) gameOver();
+}
+
+// ---------- drawing ----------
+function drawBackdrop(){
+  ctx.fillStyle = '#10151c'; ctx.fillRect(0, 0, W, H);
+  if (usingCamera && video.videoWidth){
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh);
+    const dw = vw * s, dh = vh * s;
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.globalAlpha = .28;
+    ctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh); ctx.restore();
+  }
+}
+
+function draw(){
+  drawBackdrop();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of fruits){
+    ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot);
+    ctx.font = `${f.r * 2}px serif`; ctx.fillText(f.bomb ? '💣' : f.emoji, 0, 0); ctx.restore();
+  }
+  for (const b of bits){
+    ctx.globalAlpha = Math.max(0, b.life / .6); ctx.fillStyle = b.color;
+    ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // fingertip trails
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  trails.forEach(tr => {
+    for (let i = 1; i < tr.length; i++){
+      ctx.strokeStyle = `rgba(77,214,255,${i / tr.length})`;
+      ctx.lineWidth = 2 + 8 * i / tr.length;
+      ctx.beginPath(); ctx.moveTo(tr[i-1].x, tr[i-1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke();
+    }
+  });
+  tips.forEach(t => { ctx.fillStyle = '#4dd6ff'; ctx.beginPath(); ctx.arc(t.x, t.y, 9, 0, 6.283); ctx.fill(); });
+  if (flash > 0){ ctx.fillStyle = `rgba(255,77,109,${flash * .35})`; ctx.fillRect(0, 0, W, H); }
+  ctx.fillStyle = '#f3efe6'; ctx.font = 'bold 34px "Trebuchet MS", sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(`Score ${score}`, 20, 40);
+  ctx.textAlign = 'right'; ctx.fillText('♥'.repeat(Math.max(0, lives)), W - 20, 40);
+}
+
+function loop(ts){
+  if (!running) return;
+  const dt = Math.min(.05, (ts - last) / 1000 || 0); last = ts;
+  update(dt); draw(); requestAnimationFrame(loop);
+}
+
+// ---------- input ----------
+function pushTip(i, x, y){
+  const prev = tips[i];
+  const sx = prev ? prev.x + (x - prev.x) * 0.6 : x;   // light smoothing
+  const sy = prev ? prev.y + (y - prev.y) * 0.6 : y;
+  tips[i] = { x: sx, y: sy, px: prev ? prev.x : sx, py: prev ? prev.y : sy,
+              speed: prev ? Math.hypot(sx - prev.x, sy - prev.y) : 0 };
+  const tr = trails[i] || (trails[i] = []); tr.push({ x: sx, y: sy }); if (tr.length > 10) tr.shift();
+}
+
+function onResults(res){
+  const hands = res.multiHandLandmarks || [];
+  tips.length = hands.length; trails.length = hands.length;
+  hands.forEach((lm, i) => pushTip(i, (1 - lm[8].x) * W, lm[8].y * H)); // landmark 8 = index fingertip
+}
+
+// mouse fallback for testing without a camera
+let mouseMode = false;
+canvas.addEventListener('pointermove', e => { if (mouseMode) pushTip(0, e.clientX, e.clientY); });
+canvas.addEventListener('pointerleave', () => { if (mouseMode){ tips.length = 0; trails.length = 0; } });
+
+async function startCamera(){
+  statusEl.textContent = 'Requesting camera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' } });
+    video.srcObject = stream; await video.play();
+    const hands = new Hands({ locateFile: f => MP + f });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+    usingCamera = true; mouseMode = false;
+    (async function pump(){
+      if (video.readyState >= 2) await hands.send({ image: video });
+      requestAnimationFrame(pump);
+    })();
+    return true;
+  } catch (err){
+    statusEl.textContent = 'Camera unavailable (' + err.message + '). Using mouse instead.';
+    usingCamera = false; mouseMode = true; return false;
+  }
+}
+
+let cameraStarted = false;
+async function begin(skipCamera){
+  if (skipCamera === true){ mouseMode = true; usingCamera = false; statusEl.textContent = ''; }
+  else if (!cameraStarted){ cameraStarted = true; await startCamera(); }
+  reset(); overlay.style.display = 'none'; running = true; last = performance.now(); requestAnimationFrame(loop);
+}
+function gameOver(){
+  running = false; overlay.style.display = 'flex';
+  document.getElementById('title').textContent = `Score ${score}`;
+  document.getElementById('msg').textContent = 'Wave to play again.';
+  document.getElementById('start').textContent = 'Play again';
+}
+document.getElementById('start').addEventListener('click', () => begin());
+document.getElementById('start2').addEventListener('click', () => begin(true));
+</script>
+</body>
+</html>
